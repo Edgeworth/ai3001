@@ -15,7 +15,8 @@ class Client:
 
   def write_data(self, data):
     try:
-      self.handle.sendall((data + '\n').encode('utf-8'))
+      print('CLIENT SEND "%s": %s' % (self.name, data.__repr__()))
+      self.handle.sendall((data + '\n').encode('ascii'))
     except Exception as e:
       print('Could not send data for client %s: %s' % (self, e))
       return False
@@ -34,9 +35,11 @@ class Client:
     return self.read_buffer.find('\n') != -1
 
   def pop_msg(self):
-    msg, sep, rest = self.read_buffer.rpartition('\n')
+    msg, sep, rest = self.read_buffer.partition('\n')
     if msg:
-      self.read_buffer = rest 
+      self.read_buffer = rest
+      msg = msg.strip()
+      print('CLIENT RECV "%s": %s' % (self.name, msg.__repr__()))
       return msg.strip()
     else:
       return None
@@ -44,7 +47,7 @@ class Client:
 class AuthManager:
   def __init__(self):
     self.name_to_password = {}
-    self.used_addrs = set() 
+    self.used_addrs = set()
 
   def register(self, client, name, password):
     print('Register %s %s' % (name, password))
@@ -76,37 +79,37 @@ class Game:
   def __init__(self, a, b, game_name):
     self.a = a
     self.b = b
-    self.a_waiting = None
-    self.b_waiting = None
+    self.a.waiting = None
+    self.b.waiting = None
     self.game_name = game_name
     self.finished = False
     self.result = None
     msg = 'SRT %s ' % game_name
     self.a.write_data(msg + self.b.name)
     self.b.write_data(msg + self.a.name)
-    print('Game made %s %s' % (a, b))
+    print('Game made %s %s' % (self.a.name, self.b.name))
 
   def get_ts(self):
-    return time.monotonic()    
+    return time.monotonic()
 
-  def timeout_client(self, client):
+  def client_won(self, client):
     self.finished = True
-    self.result = self.get_opposite(client)
-    self.a_waiting = None
-    self.b_waiting = None
+    self.result = client
+    self.a.waiting = None
+    self.b.waiting = None
 
   def update(self):
     print('Update')
     ts = self.get_ts()
-    timed_out_client = None 
-    if self.a_waiting and ts - self.a_waiting > self.timeout:
+    timed_out_client = None
+    if self.a.waiting and ts - self.a.waiting > self.timeout:
       timed_out_client = self.a
-    if self.b_waiting and ts - self.b_waiting > self.timeout:
-      if not timed_out_client or self.b_waiting < self.a_waiting:
+    if self.b.waiting and ts - self.b.waiting > self.timeout:
+      if not timed_out_client or self.b.waiting < self.a.waiting:
         timed_out_client = self.b
     if timed_out_client:
       print('Client timed out in %s' % self.game_name)
-      self.timeout_client(timed_out_client)
+      self.client_won(self.get_opposite(timed_out_client))
 
   def send_results(self):
     print('Sending results for game %s' % self.game_name)
@@ -131,14 +134,152 @@ class Game:
     if not self.finished:
       self.finished = True
       self.result = self.get_opposite(client)
-    
+
+  def client_data(self, client, tok):
+    if not self.handle_data(client, tok):
+      self.client_won(self.get_opposite(client))
+      return False
+    if self.has_won():
+      self.client_won(self.winner())
+    return True
+
   def handle_data(self, client, tok):
-    pass
+    return True
+
+  def has_won(self):
+    return False
+
+  def winner(self):
+    return None
 
 class KalahGame(Game):
+  a_store = 6
+  b_store = 13
+
   def __init__(self, a, b, game_name):
     Game.__init__(self, a, b, game_name)
-    self.a_waiting = self.get_ts()
+    self.board = [3] * 14
+    self.board[self.a_store] = 0
+    self.board[self.b_store] = 0
+    self.a.low_idx = 0
+    self.a.high_idx = 7
+    self.a.store = self.a_store
+    self.b.low_idx = 7
+    self.b.high_idx = 14
+    self.b.store = self.b_store
+    self.wait_for_client(self.a)
+
+  def handle_data(self, client, tok):
+    if len(tok) != 4:
+      client.error = 'Malformed command'
+      return False
+    cmd, pos = tok[2], int(tok[3])
+    pos = self.normalise_pos_for_client(client, pos)
+    if cmd != 'MOV':
+      client.error = 'Malformed command'
+      return False
+    if pos < client.low_idx or pos >= client.high_idx:
+      client.error = 'OOB index'
+      return False
+    if self.board[pos] == 0:
+      client.error = 'Must move non-zero number of seeds'
+      return False
+    if not self.client_owns_house(client, pos):
+      client.error = 'Must move own seeds'
+      return False
+    if not client.waiting:
+      client.error = 'Not your turn'
+      return False
+    client.waiting = None
+    opposite_client = self.get_opposite(client)
+    if self.move_seeds(client, pos):
+      self.update_client(opposite_client, pos)
+      self.wait_for_client(client)
+    else:
+      self.update_client(opposite_client, pos)
+      self.wait_for_client(opposite_client)
+    print(self.print_board(self.a))
+    self.a.write_data(self.print_board(self.a))
+    self.b.write_data(self.print_board(self.b))
+    return True
+
+  def normalise_pos_for_client(self, client, pos):
+    if not self.client_owns_house(client, pos):
+      return (pos + 7) % 14
+    return pos
+
+  def print_board(self, client):
+    opp = self.get_opposite(client)
+    top_str = ' '.join(
+        str(i) for i in reversed(self.board[opp.low_idx:opp.high_idx - 1]))
+    bot_str = ' '.join(
+        str(i) for i in self.board[client.low_idx:client.high_idx - 1])
+    stores = [self.board[self.b_store], self.board[self.a_store]]
+    if client != self.a:
+      stores.reverse()
+    return ' %s\n%d%s%d\n %s\n' % (
+        top_str, stores[0], ' ' * len(top_str), stores[1], bot_str)
+
+  def move_seeds(self, client, pos):
+    num_seeds = self.board[pos]
+    self.board[pos] = 0
+
+    npos = pos
+    for i in range(num_seeds):
+      npos = (npos + 1) % 14
+      if npos == self.skip_store(client):
+        npos = (npos + 1) % 14
+      self.board[npos] += 1
+    if not self.is_store(npos):
+      opp = self.get_opposite_house(npos)
+      if self.client_owns_house(client, npos) and self.board[npos] == 1:
+        self.board[client.store] += self.board[opp]
+        self.board[opp] = 0
+    else:
+      return True
+    return False
+
+  def get_opposite_house(self, pos):
+    if pos == self.a_store:
+      return self.b_store
+    if pos == self.b_store:
+      return self.a_store
+    return abs(pos - 12)
+
+  def skip_store(self, client):
+    if client.store == self.a_store:
+      return self.b_store
+    return self.a_store
+
+  def is_store(self, pos):
+    return pos == self.a_store or pos == self.b_store
+
+  def client_owns_house(self, client, pos):
+    return pos >= client.low_idx and pos < client.high_idx
+
+  def get_points(self):
+    return (sum(self.board[self.a.low_idx:self.a.high_idx]),
+            sum(self.board[self.b.low_idx:self.b.high_idx]))
+
+  def has_won(self):
+    a_pts, b_pts = self.get_points()
+    return a_pts == self.board[self.a_store] or b_pts == self.board[self.b_store]
+
+  def winner(self):
+    a_pts, b_pts = self.get_points()
+    if a_pts > b_pts:
+      return self.a
+    elif a_pts < b_pts:
+      return self.b
+    return None
+
+  def wait_for_client(self, client):
+    client.write_data('DAT %s BMP' % self.game_name)
+    client.waiting = self.get_ts()
+
+  def update_client(self, client, pos):
+    npos = self.normalise_pos_for_client(self.b, pos)
+    client.write_data('DAT %s MOV %d' % (self.game_name, npos))
 
 class GamePoolManager:
   def __init__(self, game_name, game_class):
@@ -153,6 +294,14 @@ class GamePoolManager:
     return client in self.client_to_game or client in self.clients_not_in_game
 
   def handle_game_finished(self, game):
+    if game.result:
+      winner = game.result
+      loser = game.get_opposite(game.result)
+      self.stats.get(winner.name, [0, 0, 0])[0] += 1
+      self.stats.get(loser.name, [0, 0, 0])[2] += 1
+    else:
+      self.stats.get(game.a.name, [0, 0, 0])[1] += 1
+      self.stats.get(game.b.name, [0, 0, 0])[1] += 1
     game.send_results()
     self.client_to_game.pop(game.a, None)
     self.client_to_game.pop(game.b, None)
@@ -199,20 +348,22 @@ class GamePoolManager:
     self.reap_games()
 
   def send_stats(self, client):
-    stats = self.stats.getdefault(client.name, (0, 0, 0))
+    stats = self.stats.get(client.name, [0, 0, 0])
 
-    client.write_data('%d wins, %d draws, %d losses' % stats)
+    client.write_data('%d wins, %d draws, %d losses' % tuple(stats))
     return True
 
   def handle_data(self, client, tok):
     if client not in self.client_to_game:
       client.error = 'Client not in game'
       return False
-    result = self.client_to_game[client].handle_data(client, tok)
+    result = self.client_to_game[client].client_data(client, tok)
     self.reap_games()
     return result
 
 class ClientManager:
+  commands = ['REG', 'ATH', 'IFO', 'LFG', 'DAT', 'BRD']
+
   def __init__(self):
     self.clients = {}
     self.auth_manager = AuthManager()
@@ -232,19 +383,19 @@ class ClientManager:
 
   def handle_register(self, client, tok):
     if len(tok) != 3:
-      client.error = 'Not enough arguments for command'
+      client.error = 'Wrong number of arguments for command'
       return False
     return self.auth_manager.register(client, tok[1], tok[2])
 
   def handle_auth(self, client, tok):
     if len(tok) != 3:
-      client.error = 'Not enough arguments for command'
+      client.error = 'Wrong number of arguments for command'
       return False
     return self.auth_manager.auth(client, tok[1], tok[2])
 
   def handle_get_stats(self, client, tok):
-    if len(tok) != 3:
-      client.error = 'Not enough arguments for command'
+    if len(tok) != 2:
+      client.error = 'Wrong number of arguments for command'
       return False
     if tok[1] not in self.game_to_pool_mgr:
       client.error = 'Unrecognised game type'
@@ -254,7 +405,7 @@ class ClientManager:
 
   def handle_lfg(self, client, tok):
     if len(tok) != 2:
-      client.error = 'Not enough arguments for command'
+      client.error = 'Wrong number of arguments for command'
       return False
     if tok[1] not in self.game_to_pool_mgr:
       client.error = 'Unrecognised game type'
@@ -289,10 +440,13 @@ class ClientManager:
       return self.handle_lfg(client, tok)
     if tok[0] == "DAT" and client.name:
       return self.handle_data(client, tok)
-    if client.name:
-      client.error = 'Unrecognised command'
+    if tok[0] in self.commands:
+      if not client.name:
+        client.error = 'Client not authed'
+      else:
+        client.error = 'Unknown error'
     else:
-      client.error = 'Client not authed'
+      client.error = 'Unrecognised command'
     return client.error == ''
 
   def client_data(self, handle, data):
@@ -300,7 +454,7 @@ class ClientManager:
     client.add_data(data)
     while client.has_msg():
       if not self.handle_msg(client, client.pop_msg()):
-        client.write_error()  
+        client.write_error()
         return False
     return True
 
@@ -324,9 +478,16 @@ def main():
         sockets.append(sock)
         client_manager.add_client(sock, addr)
       else:
-        data = input_socket.recv(4096).decode('utf-8')
-        client_okay = client_manager.client_data(input_socket, data)
-        if not data or not client_okay:
+        success = False
+        try:
+          data = input_socket.recv(4096)
+          if data:
+            data = data.decode('ascii')
+            success = data
+        except:
+          pass
+        client_manager.client_data(input_socket, data)
+        if not success:
           print('Client disconnected')
           input_socket.close()
           client_manager.remove_client(input_socket)
