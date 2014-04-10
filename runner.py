@@ -1,11 +1,27 @@
 import fcntl
 import optparse
 import os
-import select
+import queue
 import shlex
 import socket
 import subprocess
 import sys
+import threading
+
+def read_blocking(q, f):
+  try:
+    while f.readable():
+      l = f.readline()
+      if l:
+        if not isinstance(l, str):
+          l = l.decode('ascii')
+        print('RECV %s' % l.__repr__())
+        q.put((f, l.strip()))
+      else:
+        break
+  except:
+    pass
+  q.put((f, None))
 
 def pop_msg(buffer):
   msg, sep, rest = buffer.partition('\n')
@@ -13,9 +29,11 @@ def pop_msg(buffer):
 
 def send_cmd(server, cmd):
   try:
-    print("SEND %s" % (cmd.strip().__repr__()))
-    server.sendall((cmd.strip() + '\n').encode('ascii'))
-  except:
+    print("SEND %s" % cmd.strip().__repr__())
+    server.write(cmd.strip() + '\n')
+    server.flush()
+  except Exception as e:
+    print(e)
     return False
   return True
 
@@ -23,69 +41,69 @@ def run_program(server, program, user, game):
   send_cmd(server, 'ATH %s %s' % user)
   send_cmd(server, 'LFG %s' % game)
 
+  q = queue.Queue()
+  t_server = threading.Thread(target=read_blocking, args=(q, server))
+  t_server.daemon = True
+  t_server.start()
+  t_process = None
   process = None
-  sockets = [server]
-  buffers = {server:''}
   running = True
   while running:
-    input_sockets, _, _ = select.select(sockets, [], [])
-    for input_socket in input_sockets:
-      if not running:
-        break
+    f, msg = q.get(timeout=1000000)
 
-      if input_socket == server:
-        data = input_socket.recv(4096)
-        if data:
-          buffers[input_socket] += data.decode('ascii')
-        else:
-          print('Server closed connection')
-          running = False
-      else:
-        while True:
-          l = input_socket.read(4096)
-          if l:
-            buffers[input_socket] += l
-          else:
-            break
+    if msg is None:
+      if f == server:
+        print('Closed connection to server' % f)
+        running = False
+      elif process and f == process.stdout:
+        print('Closed connection to program')
+        continue
 
-    for sock in sockets:
-      while running:
-        msg, buffers[sock] = pop_msg(buffers[sock])
-        if msg:
-          if sock == server:
-            print('RECV: %s' % msg.__repr__())
-            tok = msg.split(' ')
-            if tok[0] == 'SRT':
-              process = subprocess.Popen(
-                  shlex.split(program),
-                  stdin=subprocess.PIPE,
-                  stdout=subprocess.PIPE,
-                  universal_newlines=True,
-                  bufsize=0)
-              fcntl.fcntl(process.stdout.fileno(), fcntl.F_SETFL, os.O_NONBLOCK)
-              sockets.append(process.stdout)
-              buffers[process.stdout] = ''
-            elif tok[0] == 'FIN':
-              running = False
-            elif tok[0] == 'DAT':
-              process.stdin.write(' '.join(tok[2:]) + '\n')
-          else:
-            if process and sock == process.stdout:
-              msg = 'DAT %s %s' % (game, msg)
-            if not send_cmd(server, msg):
-              print('Lost connection to server')
-              running = False
-        else:
-          break
-
+    if f == server:
+      tok = msg.split(' ')
+      if tok[0] == 'SRT':
+        process = subprocess.Popen(
+            shlex.split(program),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            universal_newlines=True,
+            bufsize=0)
+        t_process = threading.Thread(target=read_blocking,  args=(q, process.stdout))
+        t_process.daemon = True
+        t_process.start()
+      elif tok[0] == 'FIN':
+        print("FINISHING")
+        running = False
+      elif tok[0] == 'DAT':
+        dat = ' '.join(tok[2:]) + '\n'
+        process.stdin.write(dat)
+        process.stdin.flush()
+    else:
+      if process and f == process.stdout:
+        msg = 'DAT %s %s' % (game, msg)
+      if not send_cmd(server, msg):
+        print('Lost connection to server')
+        running = False
   if process:
-    process.terminate()
-    process.kill()
-
+    process.communicate()
 
 
 def register(server, register):
   send_cmd(server, 'REG %s %s' % register)
+
+def get_info(server, game, user):
+  send_cmd(server, 'ATH %s %s' % user)
+  send_cmd(server, 'IFO %s' % game)
+  print(server.readline().strip())
+
+def get_board(server, game):
+  send_cmd(server, 'BRD %s' % game)
+  while True:
+    l = server.readline().replace('\n', '')
+    if l and l != 'BRD FIN':
+      print(l)
+    else:
+      break
 
 def main():
   parser = optparse.OptionParser()
@@ -95,6 +113,10 @@ def main():
                     help='Program')
   parser.add_option('-u', '--user', nargs=2, dest='user',
                     help='Auth with username and password')
+  parser.add_option('-i', '--info', dest='info', action='store_true',
+                    help='Get info for a client. Requires --user and --game option')
+  parser.add_option('-b', '--board', dest='board', action='store_true',
+                    help='Get scoreboard. Requires --game option')
   parser.add_option('-r', '--register', nargs=2, dest='register',
                     help='Register with username and password')
   parser.add_option('-g', '--game',  dest='game', default='KLH',
@@ -102,10 +124,17 @@ def main():
   (options, args) = parser.parse_args()
 
   server = socket.create_connection((options.server, 31337))
-  if options.program:
-    run_program(server, options.program, options.user, options.game)
+  server_file = server.makefile('rw', encoding='ascii')
+  if options.program and options.user and options.game:
+    run_program(server_file, options.program, options.user, options.game)
   elif options.register:
-    register(server, options.register)
+    register(server_file, options.register)
+  elif options.info and options.game and options.user:
+    get_info(server_file, options.game, options.user)
+  elif options.board and options.game:
+    get_board(server_file, options.game)
+  else:
+    print('Incorrect command')
   server.close()
 
 if __name__ == '__main__':

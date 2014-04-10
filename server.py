@@ -4,6 +4,7 @@ import select
 import socket
 import sys
 import time
+import traceback
 
 class Client:
   def __init__(self, handle, addr):
@@ -15,7 +16,6 @@ class Client:
 
   def write_data(self, data):
     try:
-      print('CLIENT SEND "%s": %s' % (self.name, data.__repr__()))
       self.handle.sendall((data + '\n').encode('ascii'))
     except Exception as e:
       print('Could not send data for client %s: %s' % (self, e))
@@ -39,7 +39,6 @@ class Client:
     if msg:
       self.read_buffer = rest
       msg = msg.strip()
-      print('CLIENT RECV "%s": %s' % (self.name, msg.__repr__()))
       return msg.strip()
     else:
       return None
@@ -57,6 +56,8 @@ class AuthManager:
     if name in self.name_to_password:
       client.error = 'Already registered'
       return False
+    if len(name) > 20:
+      client.error = 'Names must be no more than 20 characters'
     self.name_to_password[name] = password
     self.used_addrs.add(client.addr)
     return True
@@ -99,7 +100,6 @@ class Game:
     self.b.waiting = None
 
   def update(self):
-    print('Update')
     ts = self.get_ts()
     timed_out_client = None
     if self.a.waiting and ts - self.a.waiting > self.timeout:
@@ -112,17 +112,27 @@ class Game:
       self.client_won(self.get_opposite(timed_out_client))
 
   def send_results(self):
-    print('Sending results for game %s' % self.game_name)
-    s_prefix = 'FIN %s ' % self.game_name
-    s_win = s_prefix + 'WIN'
-    s_lose = s_prefix + 'LSE'
-    s_draw = s_prefix + 'DRW'
+    win_name = 'noone'
     if self.result:
-      self.result.write_data(s_win)
-      self.get_opposite(self.result).write_data(s_lose)
+      win_name = self.result.name
+    print('Sending results for game %s: %s won' % (self.game_name, win_name))
+    g_prefix = 'DAT %s ' % self.game_name
+    s_prefix = 'FIN %s ' % self.game_name
+    win_str = 'WIN'
+    lose_str = 'LSE'
+    draw_str =  'DRW'
+    if self.result:
+      win = self.result
+      lose = self.get_opposite(self.result)
+      win.write_data(g_prefix + win_str)
+      lose.write_data(g_prefix + lose_str)
+      win.write_data(s_prefix + win_str)
+      lose.write_data(s_prefix + lose_str)
     else:
-      self.a.write_data(s_draw)
-      self.b.write_data(s_draw)
+      self.a.write_data(g_prefix + draw_str)
+      self.b.write_data(g_prefix + draw_str)
+      self.a.write_data(s_prefix + draw_str)
+      self.b.write_data(s_prefix + draw_str)
 
   def get_opposite(self, p):
     if p == self.a:
@@ -194,11 +204,12 @@ class KalahGame(Game):
     opposite_client = self.get_opposite(client)
     if self.move_seeds(client, pos):
       self.update_client(opposite_client, pos)
-      self.wait_for_client(client)
+      if not self.has_won():
+        self.wait_for_client(client)
     else:
       self.update_client(opposite_client, pos)
-      self.wait_for_client(opposite_client)
-    print(self.print_board(self.a))
+      if not self.has_won():
+        self.wait_for_client(opposite_client)
     self.a.write_data(self.print_board(self.a))
     self.b.write_data(self.print_board(self.b))
     return True
@@ -232,8 +243,10 @@ class KalahGame(Game):
       self.board[npos] += 1
     if not self.is_store(npos):
       opp = self.get_opposite_house(npos)
-      if self.client_owns_house(client, npos) and self.board[npos] == 1:
-        self.board[client.store] += self.board[opp]
+      if (self.client_owns_house(client, npos) and
+          self.board[npos] == 1 and self.board[opp] > 0):
+        self.board[client.store] += self.board[opp] + 1
+        self.board[npos] = 0
         self.board[opp] = 0
     else:
       return True
@@ -294,14 +307,17 @@ class GamePoolManager:
     return client in self.client_to_game or client in self.clients_not_in_game
 
   def handle_game_finished(self, game):
+    self.stats.setdefault(game.a.name, [0, 0, 0])
+    self.stats.setdefault(game.b.name, [0, 0, 0])
     if game.result:
       winner = game.result
       loser = game.get_opposite(game.result)
-      self.stats.get(winner.name, [0, 0, 0])[0] += 1
-      self.stats.get(loser.name, [0, 0, 0])[2] += 1
+
+      self.stats[winner.name][0] += 1
+      self.stats[loser.name][2] += 1
     else:
-      self.stats.get(game.a.name, [0, 0, 0])[1] += 1
-      self.stats.get(game.b.name, [0, 0, 0])[1] += 1
+      self.stats[game.a.name][1] += 1
+      self.stats[game.b.name][1] += 1
     game.send_results()
     self.client_to_game.pop(game.a, None)
     self.client_to_game.pop(game.b, None)
@@ -346,6 +362,22 @@ class GamePoolManager:
     if client in self.clients_not_in_game:
       self.clients_not_in_game.remove(client)
     self.reap_games()
+
+  def send_scoreboard(self, client):
+    if len(self.stats) == 0:
+      client.write_data('BRD FIN')
+      return True
+    align = max(max(len(k) for k in self.stats.keys()), 4)
+    name_str = '%%%ds' % align
+    header = '%s   %3s   %3s   %3s' % (name_str % 'NAME', 'WIN', 'DRW', 'LSE')
+    print_str = '%s %%5d %%5d %%5d' % name_str
+    sorted_stats = sorted((v[0], v[1], v[2], k) for k, v in self.stats.items())
+    stats = '\n'.join(print_str % (i[3], i[0], i[1], i[2]) for i in sorted_stats)
+    print(align, name_str, header)
+    client.write_data(header)
+    client.write_data(stats)
+    client.write_data('BRD FIN')
+    return True
 
   def send_stats(self, client):
     stats = self.stats.get(client.name, [0, 0, 0])
@@ -393,6 +425,16 @@ class ClientManager:
       return False
     return self.auth_manager.auth(client, tok[1], tok[2])
 
+  def handle_scoreboard(self, client, tok):
+    if len(tok) != 2:
+      client.error = 'Wrong number of arguments for command'
+      return False
+    if tok[1] not in self.game_to_pool_mgr:
+      client.error = 'Unrecognised game type'
+      return False
+
+    return self.game_to_pool_mgr[tok[1]].send_scoreboard(client)
+
   def handle_get_stats(self, client, tok):
     if len(tok) != 2:
       client.error = 'Wrong number of arguments for command'
@@ -430,15 +472,17 @@ class ClientManager:
     if len(tok) == 0:
       client.error = 'Empty command'
       return False
-    if tok[0] == "REG":
+    if tok[0] == 'REG':
       return self.handle_register(client, tok)
-    if tok[0] == "ATH":
+    if tok[0] == 'ATH':
       return self.handle_auth(client, tok)
-    if tok[0] == "IFO" and client.name:
+    if tok[0] == 'BRD':
+      return self.handle_scoreboard(client, tok)
+    if tok[0] == 'IFO' and client.name:
       return self.handle_get_stats(client, tok)
-    if tok[0] == "LFG" and client.name:
+    if tok[0] == 'LFG' and client.name:
       return self.handle_lfg(client, tok)
-    if tok[0] == "DAT" and client.name:
+    if tok[0] == 'DAT' and client.name:
       return self.handle_data(client, tok)
     if tok[0] in self.commands:
       if not client.name:
@@ -483,12 +527,13 @@ def main():
           data = input_socket.recv(4096)
           if data:
             data = data.decode('ascii')
-            success = data
-        except:
-          pass
-        client_manager.client_data(input_socket, data)
+            client_manager.client_data(input_socket, data)
+          else:
+            print('Client disconnected')
+          success = data
+        except Exception as e:
+          print(traceback.format_exc())
         if not success:
-          print('Client disconnected')
           input_socket.close()
           client_manager.remove_client(input_socket)
           sockets.remove(input_socket)
