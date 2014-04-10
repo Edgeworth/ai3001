@@ -1,4 +1,3 @@
-import fcntl
 import optparse
 import os
 import queue
@@ -108,7 +107,7 @@ def get_board(server, game):
 def main():
   parser = optparse.OptionParser()
   parser.add_option('-s', '--server', dest='server',
-                    help='Server location', default='127.0.0.1')
+                    help='Server location')
   parser.add_option('-p', '--program', dest='program',
                     help='Program')
   parser.add_option('-u', '--user', nargs=2, dest='user',
@@ -122,7 +121,9 @@ def main():
   parser.add_option('-g', '--game',  dest='game', default='KLH',
                     help='Which game to play')
   (options, args) = parser.parse_args()
-
+  if not options.server:
+    print('Need server')
+    sys.exit(1)
   server = socket.create_connection((options.server, 31337))
   server_file = server.makefile('rw', encoding='ascii')
   if options.program and options.user and options.game:

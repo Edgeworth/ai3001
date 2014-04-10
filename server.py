@@ -371,7 +371,7 @@ class GamePoolManager:
     name_str = '%%%ds' % align
     header = '%s   %3s   %3s   %3s' % (name_str % 'NAME', 'WIN', 'DRW', 'LSE')
     print_str = '%s %%5d %%5d %%5d' % name_str
-    sorted_stats = sorted((v[0], v[1], v[2], k) for k, v in self.stats.items())
+    sorted_stats = sorted([(v[0], v[1], v[2], k) for k, v in self.stats.items()], reverse=True)
     stats = '\n'.join(print_str % (i[3], i[0], i[1], i[2]) for i in sorted_stats)
     print(align, name_str, header)
     client.write_data(header)
@@ -506,7 +506,7 @@ class ClientManager:
 def main():
   server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
   server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-  server_socket.bind(('localhost', 31337))
+  server_socket.bind(('', 31337))
   server_socket.listen(5)
 
   client_manager = ClientManager()
