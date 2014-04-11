@@ -75,7 +75,7 @@ class AuthManager:
       return False
 
 class Game:
-  timeout = 1
+  timeout = 10
 
   def __init__(self, a, b, game_name):
     self.a = a
@@ -373,7 +373,6 @@ class GamePoolManager:
     print_str = '%s %%5d %%5d %%5d' % name_str
     sorted_stats = sorted([(v[0], v[1], v[2], k) for k, v in self.stats.items()], reverse=True)
     stats = '\n'.join(print_str % (i[3], i[0], i[1], i[2]) for i in sorted_stats)
-    print(align, name_str, header)
     client.write_data(header)
     client.write_data(stats)
     client.write_data('BRD FIN')
