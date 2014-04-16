@@ -5,6 +5,9 @@ import socket
 import sys
 import time
 import traceback
+import hashlib
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 class Client:
   def __init__(self, handle, addr):
@@ -44,30 +47,43 @@ class Client:
       return None
 
 class AuthManager:
-  def __init__(self):
+  def __init__(self, users_collection):
     self.name_to_password = {}
     self.used_addrs = set()
+    self.users_collection = users_collection
 
   def register(self, client, name, password):
-    print('Register %s %s' % (name, password))
-    if client.addr in self.used_addrs and client.addr != '127.0.0.1':
+    print('Register %s' % (name))
+    if (self.users_collection.find({'ip_address':client.addr}).count() != 0
+        and client.addr != '127.0.0.1'):
       client.error = 'Only one registration per ip'
-      return False
-    if name in self.name_to_password:
-      client.error = 'Already registered'
       return False
     if len(name) > 20:
       client.error = 'Names must be no more than 20 characters'
-    self.name_to_password[name] = password
-    self.used_addrs.add(client.addr)
-    return True
+      return False
+    try:
+      password_digest = hashlib.sha512()
+      password_digest.update(password.encode('utf8'))
+      self.users_collection.insert({
+        'username': name,
+        'password_digest': password_digest.hexdigest(),
+        'ip_address': client.addr,
+        'scores': []
+      })
+      return True
+    except DuplicateKeyError:
+      client.error = 'Already registered'
+      return False
 
   def auth(self, client, name, password):
-    print('Client auth %s %s' % (name, password))
-    if not name in self.name_to_password:
+    print('Client auth %s' % (name))
+    password_digest = hashlib.sha512()
+    password_digest.update(password.encode('utf8'))
+    user = self.users_collection.find_one({'username':name})
+    if user == None:
       client.error = 'Invalid credentials'
       return False
-    if self.name_to_password[name] == password:
+    if password_digest.hexdigest() == user['password_digest']:
       client.name = name
       return True
     else:
@@ -395,9 +411,10 @@ class GamePoolManager:
 class ClientManager:
   commands = ['REG', 'ATH', 'IFO', 'LFG', 'DAT', 'BRD']
 
-  def __init__(self):
+  def __init__(self, users_collection):
     self.clients = {}
-    self.auth_manager = AuthManager()
+    self.users_collection = users_collection
+    self.auth_manager = AuthManager(users_collection)
     self.game_to_pool_mgr = {'KLH':GamePoolManager('KLH', KalahGame)}
 
   def update(self):
@@ -508,7 +525,13 @@ def main():
   server_socket.bind(('', 31337))
   server_socket.listen(5)
 
-  client_manager = ClientManager()
+  database_client = MongoClient('localhost', 27017)
+  database = database_client['ai3001']
+
+  users_collection = database['users']
+  users_collection.ensure_index('username', unique=True)
+
+  client_manager = ClientManager(users_collection)
 
   sockets = [server_socket]
   while True:
