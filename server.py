@@ -311,29 +311,56 @@ class KalahGame(Game):
     client.write_data('DAT %s MOV %d' % (self.game_name, npos))
 
 class GamePoolManager:
-  def __init__(self, game_name, game_class):
+  def __init__(self, game_name, game_class, users_collection):
     self.game_name = game_name
     self.game_class = game_class
     self.games = set()
     self.stats = {}
     self.clients_not_in_game = set()
     self.client_to_game = {}
+    self.users_collection = users_collection
 
   def has_client(self, client):
     return client in self.client_to_game or client in self.clients_not_in_game
 
   def handle_game_finished(self, game):
-    self.stats.setdefault(game.a.name, [0, 0, 0])
-    self.stats.setdefault(game.b.name, [0, 0, 0])
+    self.users_collection.update(
+      {
+        'username': {'$in': [game.a.name, game.b.name]},
+        'scores.game': {'$ne': self.game_name}
+      },
+      {
+        '$addToSet':
+          {'scores':
+            {'game': self.game_name, 'wins': 0, 'draws': 0, 'losses': 0}
+          }
+      },
+      multi=True
+    )
+
     if game.result:
       winner = game.result
       loser = game.get_opposite(game.result)
 
-      self.stats[winner.name][0] += 1
-      self.stats[loser.name][2] += 1
+      self.users_collection.update(
+        {'username': winner.name, 'scores.game': self.game_name},
+        {'$inc': {'scores.$.wins': 1}}
+      )
+      self.users_collection.update(
+        {'username': loser.name, 'scores.game': self.game_name},
+        {'$inc': {'scores.$.losses': 1}}
+      )
     else:
-      self.stats[game.a.name][1] += 1
-      self.stats[game.b.name][1] += 1
+      self.users_collection.update(
+        {
+          'username':
+            {'$in': [game.a.name, game.b.name]},
+          'scores.game':
+            self.game_name
+        },
+        {'$inc': {'scores.$.draws': 1}},
+        multi=True
+      )
     game.send_results()
     self.client_to_game.pop(game.a, None)
     self.client_to_game.pop(game.b, None)
@@ -380,14 +407,22 @@ class GamePoolManager:
     self.reap_games()
 
   def send_scoreboard(self, client):
-    if len(self.stats) == 0:
+    scores_cursor = self.users_collection.find(
+                      {'scores.game':self.game_name},
+                      {'username':1, 'scores.$':1}
+                    )
+    if scores_cursor.count() == 0:
       client.write_data('BRD FIN')
       return True
-    align = max(max(len(k) for k in self.stats.keys()), 4)
+    scores = []
+    for s in scores_cursor:
+      score = s['scores'][0]
+      scores.append((score['wins'], score['draws'], score['losses'], s['username']))
+    align = max(max(len(k[3]) for k in scores), 4)
     name_str = '%%%ds' % align
     header = '%s   %3s   %3s   %3s' % (name_str % 'NAME', 'WIN', 'DRW', 'LSE')
     print_str = '%s %%5d %%5d %%5d' % name_str
-    sorted_stats = sorted([(v[0], v[1], v[2], k) for k, v in self.stats.items()], reverse=True)
+    sorted_stats = sorted(scores, reverse=True)
     stats = '\n'.join(print_str % (i[3], i[0], i[1], i[2]) for i in sorted_stats)
     client.write_data(header)
     client.write_data(stats)
@@ -395,9 +430,12 @@ class GamePoolManager:
     return True
 
   def send_stats(self, client):
-    stats = self.stats.get(client.name, [0, 0, 0])
-
-    client.write_data('%d wins, %d draws, %d losses' % tuple(stats))
+    score = self.users_collection.find_one(
+              {'username': client.name, 'scores.game': self.game_name},
+              {'scores.$': 1}
+            )['scores'][0]
+    stats = (score['wins'], score['draws'], score['losses'])
+    client.write_data('%d wins, %d draws, %d losses' % stats)
     return True
 
   def handle_data(self, client, tok):
@@ -413,9 +451,8 @@ class ClientManager:
 
   def __init__(self, users_collection):
     self.clients = {}
-    self.users_collection = users_collection
     self.auth_manager = AuthManager(users_collection)
-    self.game_to_pool_mgr = {'KLH':GamePoolManager('KLH', KalahGame)}
+    self.game_to_pool_mgr = {'KLH':GamePoolManager('KLH', KalahGame, users_collection)}
 
   def update(self):
     for pool_mgr in self.game_to_pool_mgr.values():
