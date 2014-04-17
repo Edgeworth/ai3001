@@ -54,8 +54,8 @@ class AuthManager:
 
   def register(self, client, name, password):
     print('Register %s' % (name))
-    if (self.users_collection.find({'ip_address':client.addr}).count() != 0
-        and client.addr != '127.0.0.1'):
+    if (self.users_collection.find({'ip_address':client.addr}).count() != 0 and
+        client.addr != '127.0.0.1'):
       client.error = 'Only one registration per ip'
       return False
     if len(name) > 20:
