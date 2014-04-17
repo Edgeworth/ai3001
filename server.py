@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 import select
@@ -5,6 +6,9 @@ import socket
 import sys
 import time
 import traceback
+
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
 
 class Client:
   def __init__(self, handle, addr):
@@ -44,30 +48,42 @@ class Client:
       return None
 
 class AuthManager:
-  def __init__(self):
+  def __init__(self, users_collection):
     self.name_to_password = {}
-    self.used_addrs = set()
+    self.users_collection = users_collection
 
   def register(self, client, name, password):
-    print('Register %s %s' % (name, password))
-    if client.addr in self.used_addrs and client.addr != '127.0.0.1':
+    print('Register %s' % (name))
+    if (self.users_collection.find({'ip_address':client.addr}).count() != 0 and
+        client.addr != '127.0.0.1'):
       client.error = 'Only one registration per ip'
-      return False
-    if name in self.name_to_password:
-      client.error = 'Already registered'
       return False
     if len(name) > 20:
       client.error = 'Names must be no more than 20 characters'
-    self.name_to_password[name] = password
-    self.used_addrs.add(client.addr)
-    return True
+      return False
+    try:
+      password_digest = hashlib.sha512()
+      password_digest.update(password.encode('ascii'))
+      self.users_collection.insert({
+        'username': name,
+        'password_digest': password_digest.hexdigest(),
+        'ip_address': client.addr,
+        'scores': []
+      })
+      return True
+    except DuplicateKeyError:
+      client.error = 'Already registered'
+      return False
 
   def auth(self, client, name, password):
-    print('Client auth %s %s' % (name, password))
-    if not name in self.name_to_password:
+    print('Client auth %s' % (name))
+    password_digest = hashlib.sha512()
+    password_digest.update(password.encode('ascii'))
+    user = self.users_collection.find_one({'username':name})
+    if user == None:
       client.error = 'Invalid credentials'
       return False
-    if self.name_to_password[name] == password:
+    if password_digest.hexdigest() == user['password_digest']:
       client.name = name
       return True
     else:
@@ -295,29 +311,56 @@ class KalahGame(Game):
     client.write_data('DAT %s MOV %d' % (self.game_name, npos))
 
 class GamePoolManager:
-  def __init__(self, game_name, game_class):
+  def __init__(self, game_name, game_class, users_collection):
     self.game_name = game_name
     self.game_class = game_class
     self.games = set()
     self.stats = {}
     self.clients_not_in_game = set()
     self.client_to_game = {}
+    self.users_collection = users_collection
 
   def has_client(self, client):
     return client in self.client_to_game or client in self.clients_not_in_game
 
   def handle_game_finished(self, game):
-    self.stats.setdefault(game.a.name, [0, 0, 0])
-    self.stats.setdefault(game.b.name, [0, 0, 0])
+    self.users_collection.update(
+        {
+          'username': {'$in': [game.a.name, game.b.name]},
+          'scores.game': {'$ne': self.game_name}
+        },
+        {
+          '$addToSet':
+            {'scores':
+              {'game': self.game_name, 'wins': 0, 'draws': 0, 'losses': 0}
+            }
+        },
+        multi=True
+    )
+
     if game.result:
       winner = game.result
       loser = game.get_opposite(game.result)
 
-      self.stats[winner.name][0] += 1
-      self.stats[loser.name][2] += 1
+      self.users_collection.update(
+        {'username': winner.name, 'scores.game': self.game_name},
+        {'$inc': {'scores.$.wins': 1}}
+      )
+      self.users_collection.update(
+        {'username': loser.name, 'scores.game': self.game_name},
+        {'$inc': {'scores.$.losses': 1}}
+      )
     else:
-      self.stats[game.a.name][1] += 1
-      self.stats[game.b.name][1] += 1
+      self.users_collection.update(
+        {
+          'username':
+            {'$in': [game.a.name, game.b.name]},
+          'scores.game':
+            self.game_name
+        },
+        {'$inc': {'scores.$.draws': 1}},
+        multi=True
+      )
     game.send_results()
     self.client_to_game.pop(game.a, None)
     self.client_to_game.pop(game.b, None)
@@ -364,14 +407,22 @@ class GamePoolManager:
     self.reap_games()
 
   def send_scoreboard(self, client):
-    if len(self.stats) == 0:
+    scores_cursor = self.users_collection.find(
+        {'scores.game':self.game_name},
+        {'username':1, 'scores.$':1}
+    )
+    if scores_cursor.count() == 0:
       client.write_data('BRD FIN')
       return True
-    align = max(max(len(k) for k in self.stats.keys()), 4)
+    scores = []
+    for s in scores_cursor:
+      score = s['scores'][0]
+      scores.append((score['wins'], score['draws'], score['losses'], s['username']))
+    align = max(max(len(k[3]) for k in scores), 4)
     name_str = '%%%ds' % align
     header = '%s   %3s   %3s   %3s' % (name_str % 'NAME', 'WIN', 'DRW', 'LSE')
     print_str = '%s %%5d %%5d %%5d' % name_str
-    sorted_stats = sorted([(v[0], v[1], v[2], k) for k, v in self.stats.items()], reverse=True)
+    sorted_stats = sorted(scores, reverse=True)
     stats = '\n'.join(print_str % (i[3], i[0], i[1], i[2]) for i in sorted_stats)
     client.write_data(header)
     client.write_data(stats)
@@ -379,9 +430,18 @@ class GamePoolManager:
     return True
 
   def send_stats(self, client):
-    stats = self.stats.get(client.name, [0, 0, 0])
+    score = self.users_collection.find_one(
+        {'username': client.name, 'scores.game': self.game_name},
+        {'scores.$': 1}
+    )
 
-    client.write_data('%d wins, %d draws, %d losses' % tuple(stats))
+    if score == None:
+      stats = (0, 0, 0)
+    else:
+      score = score['scores'][0]
+      stats = (score['wins'], score['draws'], score['losses'])
+
+    client.write_data('%d wins, %d draws, %d losses' % stats)
     return True
 
   def handle_data(self, client, tok):
@@ -395,10 +455,10 @@ class GamePoolManager:
 class ClientManager:
   commands = ['REG', 'ATH', 'IFO', 'LFG', 'DAT', 'BRD']
 
-  def __init__(self):
+  def __init__(self, users_collection):
     self.clients = {}
-    self.auth_manager = AuthManager()
-    self.game_to_pool_mgr = {'KLH':GamePoolManager('KLH', KalahGame)}
+    self.auth_manager = AuthManager(users_collection)
+    self.game_to_pool_mgr = {'KLH':GamePoolManager('KLH', KalahGame, users_collection)}
 
   def update(self):
     for pool_mgr in self.game_to_pool_mgr.values():
@@ -508,7 +568,13 @@ def main():
   server_socket.bind(('', 31337))
   server_socket.listen(5)
 
-  client_manager = ClientManager()
+  database_client = MongoClient('localhost', 27017)
+  database = database_client['ai3001']
+
+  users_collection = database['users']
+  users_collection.ensure_index('username', unique=True)
+
+  client_manager = ClientManager(users_collection)
 
   sockets = [server_socket]
   while True:
