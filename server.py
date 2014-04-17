@@ -436,7 +436,7 @@ class GamePoolManager:
     )
 
     if score == None:
-      stats = (0,0,0)
+      stats = (0, 0, 0)
     else:
       score = score['scores'][0]
       stats = (score['wins'], score['draws'], score['losses'])
