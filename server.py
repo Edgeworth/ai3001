@@ -50,7 +50,6 @@ class Client:
 class AuthManager:
   def __init__(self, users_collection):
     self.name_to_password = {}
-    self.used_addrs = set()
     self.users_collection = users_collection
 
   def register(self, client, name, password):
