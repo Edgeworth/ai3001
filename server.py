@@ -434,8 +434,14 @@ class GamePoolManager:
     score = self.users_collection.find_one(
         {'username': client.name, 'scores.game': self.game_name},
         {'scores.$': 1}
-    )['scores'][0]
-    stats = (score['wins'], score['draws'], score['losses'])
+    )
+
+    if score == None:
+      stats = (0,0,0)
+    else:
+      score = score['scores'][0]
+      stats = (score['wins'], score['draws'], score['losses'])
+
     client.write_data('%d wins, %d draws, %d losses' % stats)
     return True
 
