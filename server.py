@@ -326,17 +326,17 @@ class GamePoolManager:
 
   def handle_game_finished(self, game):
     self.users_collection.update(
-      {
-        'username': {'$in': [game.a.name, game.b.name]},
-        'scores.game': {'$ne': self.game_name}
-      },
-      {
-        '$addToSet':
-          {'scores':
-            {'game': self.game_name, 'wins': 0, 'draws': 0, 'losses': 0}
-          }
-      },
-      multi=True
+        {
+          'username': {'$in': [game.a.name, game.b.name]},
+          'scores.game': {'$ne': self.game_name}
+        },
+        {
+          '$addToSet':
+            {'scores':
+              {'game': self.game_name, 'wins': 0, 'draws': 0, 'losses': 0}
+            }
+        },
+        multi=True
     )
 
     if game.result:
@@ -409,9 +409,9 @@ class GamePoolManager:
 
   def send_scoreboard(self, client):
     scores_cursor = self.users_collection.find(
-                      {'scores.game':self.game_name},
-                      {'username':1, 'scores.$':1}
-                    )
+        {'scores.game':self.game_name},
+        {'username':1, 'scores.$':1}
+    )
     if scores_cursor.count() == 0:
       client.write_data('BRD FIN')
       return True
@@ -432,9 +432,9 @@ class GamePoolManager:
 
   def send_stats(self, client):
     score = self.users_collection.find_one(
-              {'username': client.name, 'scores.game': self.game_name},
-              {'scores.$': 1}
-            )['scores'][0]
+        {'username': client.name, 'scores.game': self.game_name},
+        {'scores.$': 1}
+    )['scores'][0]
     stats = (score['wins'], score['draws'], score['losses'])
     client.write_data('%d wins, %d draws, %d losses' % stats)
     return True
