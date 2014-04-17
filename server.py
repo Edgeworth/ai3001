@@ -64,7 +64,7 @@ class AuthManager:
       return False
     try:
       password_digest = hashlib.sha512()
-      password_digest.update(password.encode('utf8'))
+      password_digest.update(password.encode('ascii'))
       self.users_collection.insert({
         'username': name,
         'password_digest': password_digest.hexdigest(),
@@ -79,7 +79,7 @@ class AuthManager:
   def auth(self, client, name, password):
     print('Client auth %s' % (name))
     password_digest = hashlib.sha512()
-    password_digest.update(password.encode('utf8'))
+    password_digest.update(password.encode('ascii'))
     user = self.users_collection.find_one({'username':name})
     if user == None:
       client.error = 'Invalid credentials'
