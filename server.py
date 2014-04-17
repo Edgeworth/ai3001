@@ -1,3 +1,4 @@
+import hashlib
 import os
 import random
 import select
@@ -5,7 +6,7 @@ import socket
 import sys
 import time
 import traceback
-import hashlib
+
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 
